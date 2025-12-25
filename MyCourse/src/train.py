@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+import warnings
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -24,6 +25,11 @@ try:
 except Exception:
     torch = None
 
+try:
+    from tqdm import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
+
 import librosa
 
 DEFAULT_TRAIN = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits/train_full.npz")
@@ -38,12 +44,35 @@ class TrainConfig:
     random_seed: int = 42
 
 
+@dataclass
+class MLPStableConfig:
+    hidden_layer_sizes: Tuple[int, int] = (128, 64)
+    alpha: float = 1e-3
+    lr: float = 1e-3
+    epochs: int = 200
+
+
 def load_features(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     data = np.load(path, allow_pickle=True)
     X = data["X"].astype(np.float32)
     y = data["labels"].astype(str)
     paths = data["paths"].astype(str)
     return X, y, paths
+
+
+def log_feature_stats(name: str, X: np.ndarray) -> None:
+    finite_mask = np.isfinite(X)
+    finite_ratio = float(np.mean(finite_mask))
+    print(
+        f"[{name}] shape={X.shape} finite={finite_ratio:.3f} "
+        f"min={np.nanmin(X):.4f} max={np.nanmax(X):.4f}"
+    )
+
+
+def log_label_stats(name: str, y: np.ndarray) -> None:
+    unique, counts = np.unique(y, return_counts=True)
+    dist = ", ".join([f"{u}:{c}" for u, c in zip(unique, counts)])
+    print(f"[{name}] samples={len(y)} classes={len(unique)} dist={{ {dist} }}")
 
 
 def sanitize_features(
@@ -56,6 +85,36 @@ def sanitize_features(
     X_train = np.clip(X_train, low, high)
     X_val = np.clip(X_val, low, high)
     return X_train, X_val
+
+
+def compute_clip_bounds(
+    X: np.ndarray, low_q: float = 1.0, high_q: float = 99.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    low = np.percentile(X, low_q, axis=0)
+    high = np.percentile(X, high_q, axis=0)
+    return low, high
+
+
+def apply_clip(X: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
+    return np.clip(X, low, high)
+
+
+def preprocess_mlp(
+    X_train: np.ndarray, X_val: np.ndarray
+) -> Tuple[np.ndarray, np.ndarray, StandardScaler, Tuple[np.ndarray, np.ndarray]]:
+    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
+    low, high = compute_clip_bounds(X_train, low_q=1.0, high_q=99.0)
+    X_train = apply_clip(X_train, low, high)
+    X_val = apply_clip(X_val, low, high)
+
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_val = scaler.transform(X_val)
+
+    X_train = np.clip(X_train, -3.0, 3.0)
+    X_val = np.clip(X_val, -3.0, 3.0)
+    return X_train, X_val, scaler, (low, high)
 
 
 def macro_auc(y_true: np.ndarray, y_proba: np.ndarray, classes: List[int]) -> float:
@@ -88,11 +147,13 @@ def cv_score(
     X: np.ndarray,
     y: np.ndarray,
     cfg: TrainConfig,
-) -> Tuple[Dict[str, Any], float]:
+) -> Tuple[Dict[str, Any], float, int]:
     skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.random_seed)
     best_params: Dict[str, Any] = {}
     best_score = -np.inf
-    for params in param_grid:
+    failed_folds = 0
+    iterator = tqdm(param_grid, desc="CV params", unit="cfg") if tqdm else param_grid
+    for params in iterator:
         scores = []
         for train_idx, val_idx in skf.split(X, y):
             model = build_model(params)
@@ -103,12 +164,13 @@ def cv_score(
                 if not np.isnan(score):
                     scores.append(score)
             except ValueError:
+                failed_folds += 1
                 continue
         mean_score = float(np.mean(scores)) if scores else float("-inf")
         if mean_score > best_score:
             best_score = mean_score
             best_params = params
-    return best_params, best_score
+    return best_params, best_score, failed_folds
 
 
 def build_knn(params: Dict[str, Any]) -> Pipeline:
@@ -124,17 +186,31 @@ def build_rf(params: Dict[str, Any]) -> RandomForestClassifier:
     return RandomForestClassifier(random_state=42, **params)
 
 
-def build_mlp(params: Dict[str, Any]) -> Pipeline:
-    clf = MLPClassifier(
-        hidden_layer_sizes=(128, 64),
-        max_iter=400,
+def train_mlp_stable(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    cfg: MLPStableConfig,
+) -> Tuple[MLPClassifier, Dict[str, float]]:
+    model = MLPClassifier(
+        hidden_layer_sizes=cfg.hidden_layer_sizes,
+        solver="adam",
+        activation="relu",
+        learning_rate_init=cfg.lr,
+        learning_rate="adaptive",
+        alpha=cfg.alpha,
+        max_iter=cfg.epochs,
         early_stopping=True,
+        validation_fraction=0.1,
         n_iter_no_change=10,
-        tol=1e-4,
         random_state=42,
-        **params,
     )
-    return Pipeline([("scaler", StandardScaler()), ("clf", clf)])
+    model.fit(X_train, y_train)
+    y_proba = model.predict_proba(X_val)
+    y_pred = np.argmax(y_proba, axis=1)
+    metrics = evaluate_metrics(y_val, y_pred, y_proba)
+    return model, metrics
 
 
 class MFCCDataset(Dataset):
@@ -268,6 +344,11 @@ def main() -> None:
     X_train, y_train, train_paths = load_features(args.train)
     X_val, y_val, val_paths = load_features(args.val)
     X_train, X_val = sanitize_features(X_train, X_val)
+    log_feature_stats("train", X_train)
+    log_feature_stats("val", X_val)
+    log_label_stats("train", y_train)
+    log_label_stats("val", y_val)
+    print(f"[paths] train_paths={len(train_paths)} val_paths={len(val_paths)}")
 
     le = LabelEncoder()
     le.fit(np.concatenate([y_train, y_val]))
@@ -287,24 +368,57 @@ def main() -> None:
         for n in [100, 200]
         for d in [5, 10, None]
     ]
-    mlp_grid = [
-        {"alpha": a, "learning_rate_init": lr}
-        for a in [1e-3, 1e-2]
-        for lr in [1e-4, 5e-5]
-    ]
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    warnings.filterwarnings("ignore", category=UserWarning)
 
     for name, builder, grid in [
         ("knn", build_knn, knn_grid),
         ("rf", build_rf, rf_grid),
-        ("mlp", build_mlp, mlp_grid),
     ]:
-        best_params, cv_auc = cv_score(builder, grid, X_train, y_train_enc, cfg)
-        model = builder(best_params)
-        model.fit(X_train, y_train_enc)
-        y_proba = model.predict_proba(X_val)
-        y_pred = np.argmax(y_proba, axis=1)
-        metrics = evaluate_metrics(y_val_enc, y_pred, y_proba)
-        results[name] = {"best_params": best_params, "cv_macro_auc": cv_auc, "val": metrics}
+        if tqdm is None:
+            print(f"Training {name}...")
+        print(f"[{name}] cv_folds={cfg.n_splits} grid_size={len(grid)}")
+        best_params, cv_auc, failed_folds = cv_score(builder, grid, X_train, y_train_enc, cfg)
+        try:
+            model = builder(best_params)
+            model.fit(X_train, y_train_enc)
+            y_proba = model.predict_proba(X_val)
+            y_pred = np.argmax(y_proba, axis=1)
+            metrics = evaluate_metrics(y_val_enc, y_pred, y_proba)
+            results[name] = {"best_params": best_params, "cv_macro_auc": cv_auc, "val": metrics}
+            print(
+                f"[{name}] cv_macro_auc={cv_auc:.4f} "
+                f"val_auc={metrics['macro_auc']:.4f} "
+                f"val_acc={metrics['accuracy']:.4f} "
+                f"val_f1={metrics['macro_f1']:.4f} "
+                f"failed_folds={failed_folds}"
+            )
+        except ValueError as exc:
+            results[name] = {
+                "best_params": best_params,
+                "cv_macro_auc": cv_auc,
+                "error": str(exc),
+            }
+            print(f"[{name}] failed after CV: {exc} failed_folds={failed_folds}")
+
+    mlp_cfg = MLPStableConfig()
+    X_train_mlp, X_val_mlp, mlp_scaler, clip_bounds = preprocess_mlp(X_train, X_val)
+    try:
+        mlp_model, mlp_metrics = train_mlp_stable(
+            X_train_mlp, y_train_enc, X_val_mlp, y_val_enc, mlp_cfg
+        )
+        results["mlp"] = {
+            "config": mlp_cfg.__dict__,
+            "val": mlp_metrics,
+        }
+        print(
+            f"[mlp] val_auc={mlp_metrics['macro_auc']:.4f} "
+            f"val_acc={mlp_metrics['accuracy']:.4f} "
+            f"val_f1={mlp_metrics['macro_f1']:.4f}"
+        )
+    except ValueError as exc:
+        results["mlp"] = {"config": mlp_cfg.__dict__, "error": str(exc)}
+        print(f"[mlp] failed: {exc}")
 
     if args.include_cnn:
         train_audio, y_train_audio = filter_existing_audio(train_paths, y_train)
@@ -346,13 +460,36 @@ def main() -> None:
         y_full = np.concatenate([y_train_enc, y_val_enc])
         if best_name == "knn":
             final_model = build_knn(results["knn"]["best_params"])
+            final_model.fit(X_full, y_full)
+            payload = {"model": final_model, "label_encoder": le}
         elif best_name == "rf":
             final_model = build_rf(results["rf"]["best_params"])
+            final_model.fit(X_full, y_full)
+            payload = {"model": final_model, "label_encoder": le}
         else:
-            final_model = build_mlp(results["mlp"]["best_params"])
-        final_model.fit(X_full, y_full)
+            X_full_mlp, _, mlp_scaler, clip_bounds = preprocess_mlp(X_full, X_full)
+            final_model = MLPClassifier(
+                hidden_layer_sizes=mlp_cfg.hidden_layer_sizes,
+                solver="adam",
+                activation="relu",
+                learning_rate_init=mlp_cfg.lr,
+                learning_rate="adaptive",
+                alpha=mlp_cfg.alpha,
+                max_iter=mlp_cfg.epochs,
+                early_stopping=True,
+                validation_fraction=0.1,
+                n_iter_no_change=10,
+                random_state=42,
+            )
+            final_model.fit(X_full_mlp, y_full)
+            payload = {
+                "model": final_model,
+                "label_encoder": le,
+                "scaler": mlp_scaler,
+                "clip_bounds": clip_bounds,
+            }
         args.model_path.parent.mkdir(parents=True, exist_ok=True)
-        dump({"model": final_model, "label_encoder": le}, args.model_path)
+        dump(payload, args.model_path)
 
 
 if __name__ == "__main__":

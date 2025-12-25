@@ -1,0 +1,43 @@
+{
+  "knn": {
+    "best_params": {
+      "n_neighbors": 3,
+      "weights": "distance"
+    },
+    "cv_macro_auc": 0.9429923620248184,
+    "val": {
+      "macro_auc": 0.565203225662372,
+      "accuracy": 0.2,
+      "macro_f1": 0.1948184134765017
+    }
+  },
+  "rf": {
+    "best_params": {
+      "n_estimators": 200,
+      "max_depth": null
+    },
+    "cv_macro_auc": 0.977479527463856,
+    "val": {
+      "macro_auc": 0.7794377171420332,
+      "accuracy": 0.4,
+      "macro_f1": 0.39369453308582436
+    }
+  },
+  "mlp": {
+    "config": {
+      "hidden_layer_sizes": [
+        128,
+        64
+      ],
+      "alpha": 0.001,
+      "lr": 0.001,
+      "epochs": 200
+    },
+    "val": {
+      "macro_auc": 0.7300814356834435,
+      "accuracy": 0.3217391304347826,
+      "macro_f1": 0.3162673655320714
+    }
+  },
+  "best_model": "rf"
+}
