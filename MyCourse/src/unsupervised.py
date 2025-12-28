@@ -12,7 +12,8 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 from sklearn.cluster import KMeans
-from sklearn.metrics import adjusted_rand_score, confusion_matrix, normalized_mutual_info_score, silhouette_score
+from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score, silhouette_score
+from sklearn.metrics.cluster import contingency_matrix
 
 DEFAULT_FEATURES = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits/train_full.npz")
 DEFAULT_OUT_DIR = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results")
@@ -50,7 +51,7 @@ def compute_metrics(X: np.ndarray, y: np.ndarray, clusters: np.ndarray) -> Dict[
 
 def plot_confusion(y: np.ndarray, clusters: np.ndarray, out_path: Path) -> None:
     labels = np.unique(y)
-    conf = confusion_matrix(y, clusters, labels=labels)
+    conf = contingency_matrix(y, clusters)
     row_sums = conf.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1
     conf_norm = conf / row_sums

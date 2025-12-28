@@ -82,6 +82,10 @@ def plot_box_violin_kde(
     for feat in features:
         if feat not in df.columns:
             continue
+        values = df[feat].to_numpy()
+        if np.nanstd(values) == 0.0:
+            print(f"[warn] skip {feat}: constant values")
+            continue
         fig, axes = plt.subplots(1, 3, figsize=(16, 4))
         sns.boxplot(data=df, x="label", y=feat, ax=axes[0])
         axes[0].set_title(f"Box Plot - {feat}")
@@ -131,6 +135,18 @@ def plot_pca_tsne(
     df_sub = _subset_df(df, cfg)
     X = df_sub.drop(columns=["label"]).to_numpy()
     y = df_sub["label"].to_numpy()
+    if X.shape[0] < 2:
+        print("[warn] skip PCA/t-SNE: not enough samples")
+        return
+    std = np.nanstd(X, axis=0)
+    keep = std > 1e-8
+    if not np.any(keep):
+        print("[warn] skip PCA/t-SNE: all features are constant")
+        return
+    X = X[:, keep]
+    if np.unique(X, axis=0).shape[0] < 2:
+        print("[warn] skip PCA/t-SNE: only one unique sample")
+        return
 
     pca = PCA(n_components=2, random_state=cfg.random_seed)
     X_pca = pca.fit_transform(X)

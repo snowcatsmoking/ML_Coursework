@@ -14,10 +14,10 @@ import seaborn as sns
 from sklearn.cluster import KMeans
 from sklearn.metrics import (
     adjusted_rand_score,
-    confusion_matrix,
     normalized_mutual_info_score,
     silhouette_score,
 )
+from sklearn.metrics.cluster import contingency_matrix
 
 # ---------------------------------------------------------------------
 # 1) Paths (keep original .npz path)
@@ -85,7 +85,7 @@ def plot_confusion(
     show: bool = True,
 ) -> None:
     labels = np.unique(y)
-    conf = confusion_matrix(y, clusters, labels=labels)
+    conf = contingency_matrix(y, clusters)
     row_sums = conf.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1
     conf_norm = conf / row_sums

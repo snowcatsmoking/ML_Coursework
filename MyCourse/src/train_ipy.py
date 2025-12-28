@@ -39,6 +39,14 @@ DEFAULT_TRAIN = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits
 DEFAULT_VAL = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits/val.npz")
 DEFAULT_OUT = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results")
 DEFAULT_MODEL = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/models/final_model.pkl")
+DEFAULT_MODEL_DIR = DEFAULT_MODEL.parent
+DEFAULT_MODEL_PATHS = {
+    "knn": DEFAULT_MODEL_DIR / "knn_model.pkl",
+    "rf": DEFAULT_MODEL_DIR / "rf_model.pkl",
+    "mlp": DEFAULT_MODEL_DIR / "mlp_model.pkl",
+    "cnn": DEFAULT_MODEL_DIR / "cnn_model.pkl",
+    "final": DEFAULT_MODEL,
+}
 
 
 # ---------------------------------------------------------------------
@@ -318,9 +326,17 @@ def train_cnn(
     optim = torch.optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
-    for _ in range(epochs):
+    for epoch in range(1, epochs + 1):
         model.train()
-        for xb, yb in train_loader:
+        batch_iter = train_loader
+        if tqdm:
+            batch_iter = tqdm(
+                train_loader,
+                desc=f"CNN train {epoch}/{epochs}",
+                unit="batch",
+                leave=False,
+            )
+        for xb, yb in batch_iter:
             xb = xb.to(device)
             yb = yb.to(device)
             optim.zero_grad()
@@ -357,6 +373,76 @@ def filter_existing_audio(paths: np.ndarray, labels: np.ndarray) -> Tuple[List[s
             out_paths.append(p)
             out_labels.append(y)
     return out_paths, np.asarray(out_labels)
+
+
+def save_payload(payload: Dict[str, Any], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    dump(payload, path)
+
+
+def retrain_and_save_sklearn_models(
+    results: Dict[str, Any],
+    X_train: np.ndarray,
+    X_val: np.ndarray,
+    y_train_enc: np.ndarray,
+    y_val_enc: np.ndarray,
+    label_encoder: LabelEncoder,
+    mlp_cfg: MLPStableConfig,
+    model_paths: Dict[str, Path] | None = None,
+) -> Dict[str, Path]:
+    paths = model_paths or DEFAULT_MODEL_PATHS
+    saved: Dict[str, Path] = {}
+    X_full = np.vstack([X_train, X_val])
+    y_full = np.concatenate([y_train_enc, y_val_enc])
+
+    if "knn" in results and "best_params" in results["knn"]:
+        model = build_knn(results["knn"]["best_params"])
+        model.fit(X_full, y_full)
+        save_payload({"model": model, "label_encoder": label_encoder}, paths["knn"])
+        saved["knn"] = paths["knn"]
+
+    if "rf" in results and "best_params" in results["rf"]:
+        model = build_rf(results["rf"]["best_params"])
+        model.fit(X_full, y_full)
+        save_payload({"model": model, "label_encoder": label_encoder}, paths["rf"])
+        saved["rf"] = paths["rf"]
+
+    if "mlp" in results and "config" in results["mlp"]:
+        X_full_mlp, _, mlp_scaler, clip_bounds = preprocess_mlp(X_full, X_full)
+        model = MLPClassifier(
+            hidden_layer_sizes=mlp_cfg.hidden_layer_sizes,
+            solver="adam",
+            activation="relu",
+            learning_rate_init=mlp_cfg.lr,
+            learning_rate="adaptive",
+            alpha=mlp_cfg.alpha,
+            max_iter=mlp_cfg.epochs,
+            early_stopping=True,
+            validation_fraction=0.1,
+            n_iter_no_change=10,
+            random_state=42,
+        )
+        model.fit(X_full_mlp, y_full)
+        payload = {
+            "model": model,
+            "label_encoder": label_encoder,
+            "scaler": mlp_scaler,
+            "clip_bounds": clip_bounds,
+        }
+        save_payload(payload, paths["mlp"])
+        saved["mlp"] = paths["mlp"]
+
+    return saved
+
+
+def save_cnn_artifacts(
+    cnn_artifacts: Dict[str, Any] | None, model_paths: Dict[str, Path] | None = None
+) -> Path | None:
+    if cnn_artifacts is None:
+        return None
+    paths = model_paths or DEFAULT_MODEL_PATHS
+    save_payload(cnn_artifacts, paths["cnn"])
+    return paths["cnn"]
 
 
 # ---------------------------------------------------------------------
@@ -508,3 +594,21 @@ def filter_existing_audio(paths: np.ndarray, labels: np.ndarray) -> Tuple[List[s
 #         }
 #     DEFAULT_MODEL.parent.mkdir(parents=True, exist_ok=True)
 #     dump(payload, DEFAULT_MODEL)
+#
+# # Save all sklearn models (KNN/RF/MLP) for multi-model evaluation
+# saved_paths = retrain_and_save_sklearn_models(
+#     results,
+#     X_train,
+#     X_val,
+#     y_train_enc,
+#     y_val_enc,
+#     le,
+#     mlp_cfg,
+#     model_paths=DEFAULT_MODEL_PATHS,
+# )
+# print(f"saved sklearn models: {saved_paths}")
+#
+# # Save CNN if trained
+# if "cnn" in results and "val" in results["cnn"]:
+#     cnn_path = save_cnn_artifacts(cnn_artifacts, model_paths=DEFAULT_MODEL_PATHS)
+#     print(f"saved cnn model: {cnn_path}")
