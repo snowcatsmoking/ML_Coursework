@@ -1,7 +1,11 @@
-"""Notebook-friendly feature extraction for hum/whistle audio classification.
+"""Notebook-friendly feature extraction for 8-way song ID (hum + whistle).
 
-This file mirrors `features.py` but is organized with section comments and
-step-by-step notes so you can paste blocks into a Jupyter notebook.
+We keep the feature story simple for the notebook:
+1) 原始音频小结: 时长/能量/亮度，先看录制质量与hum/whistle差异。
+2) Melody/Contour: F0轮廓与音高步长，支撑歌曲旋律判别。
+3) Rhythm: 起音间隔/速度，补充节奏线索。
+4) Timbre envelope: MFCC + ΔMFCC 概括整体音色，避免被单次噪声牵制。
+下一个部分的EDA会用这些特征名字做可视化，保持命名清晰。
 """
 
 from __future__ import annotations
@@ -23,11 +27,6 @@ os.environ.setdefault("NUMBA_DISABLE_JIT", "1")
 
 import librosa
 import numpy as np
-from __future__ import annotations
-import os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
 
 # ---------------------------------------------------------------------
 # 1) Paths and constants (edit for your machine)
@@ -84,7 +83,31 @@ def load_audio(path: str, cfg: FeatureConfig) -> Tuple[np.ndarray, int]:
 
 
 # ---------------------------------------------------------------------
-# 5) MFCC + delta features
+# 5) 原始音频小结 (录制质量 + hum/whistle差异)
+# ---------------------------------------------------------------------
+def signal_summary(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
+    duration = float(len(y)) / float(cfg.sr) if cfg.sr > 0 else 0.0
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=cfg.hop_length)[0]
+    zcr = librosa.feature.zero_crossing_rate(y, hop_length=cfg.hop_length)[0]
+    centroid = librosa.feature.spectral_centroid(y=y, sr=cfg.sr, hop_length=cfg.hop_length)[0]
+    rolloff = librosa.feature.spectral_rolloff(y=y, sr=cfg.sr, roll_percent=0.85, hop_length=cfg.hop_length)[0]
+
+    rms_mean, rms_std = _safe_mean_std(rms)
+    zcr_mean, zcr_std = _safe_mean_std(zcr)
+    centroid_mean, centroid_std = _safe_mean_std(centroid)
+    rolloff_mean, rolloff_std = _safe_mean_std(rolloff)
+
+    return [
+        duration,        # overall length,检查是否截断
+        rms_mean, rms_std,  # loudness footprint, hum vs whistle
+        zcr_mean, zcr_std,  # breathy/noisy content
+        centroid_mean, centroid_std,  # brightness
+        rolloff_mean, rolloff_std,    # high-frequency energy proportion
+    ]
+
+
+# ---------------------------------------------------------------------
+# 6) MFCC + delta features (timbre envelope)
 # ---------------------------------------------------------------------
 def mfcc_features(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
     mfcc = librosa.feature.mfcc(
@@ -104,7 +127,7 @@ def mfcc_features(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
 
 
 # ---------------------------------------------------------------------
-# 6) F0 / pitch contour features (pyin)
+# 7) F0 / pitch contour features (pyin)
 # ---------------------------------------------------------------------
 def f0_features(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
     f0, voiced_flag, voiced_prob = librosa.pyin(
@@ -176,7 +199,7 @@ def f0_features(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
 
 
 # ---------------------------------------------------------------------
-# 7) Rhythm / onset features
+# 8) Rhythm / onset features
 # ---------------------------------------------------------------------
 def _estimate_tempo(onset_env: np.ndarray, cfg: FeatureConfig) -> float:
     if onset_env.size < 2:
@@ -223,12 +246,13 @@ def rhythm_features(y: np.ndarray, cfg: FeatureConfig) -> List[float]:
 
 
 # ---------------------------------------------------------------------
-# 8) Full feature vector helpers
+# 9) Full feature vector helpers
 # ---------------------------------------------------------------------
 def extract_features(path: str, cfg: FeatureConfig | None = None) -> np.ndarray:
     cfg = cfg or FeatureConfig()
     y, _ = load_audio(path, cfg)
     feats: List[float] = []
+    feats.extend(signal_summary(y, cfg))
     feats.extend(mfcc_features(y, cfg))
     feats.extend(f0_features(y, cfg))
     feats.extend(rhythm_features(y, cfg))
@@ -258,6 +282,19 @@ def batch_extract(
 def feature_names(cfg: FeatureConfig | None = None) -> List[str]:
     cfg = cfg or FeatureConfig()
     names: List[str] = []
+    names.extend(
+        [
+            "duration_sec",
+            "rms_mean",
+            "rms_std",
+            "zcr_mean",
+            "zcr_std",
+            "centroid_mean",
+            "centroid_std",
+            "rolloff_mean",
+            "rolloff_std",
+        ]
+    )
     for i in range(cfg.n_mfcc):
         names.append(f"mfcc_mean_{i+1}")
     for i in range(cfg.n_mfcc):

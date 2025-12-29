@@ -1,12 +1,17 @@
-"""Notebook-friendly training utilities for hum/whistle song classification."""
+"""训练脚本：KNN + RF + MLP + DeepMLP (PyTorch)
+
+修复问题：
+1. MLP预处理逻辑修复（先计算clip边界再clip）
+2. 用PyTorch DeepMLP替换CNN（CNN不适合手工特征）
+"""
 
 from __future__ import annotations
 
 import json
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
 import numpy as np
 from joblib import dump
@@ -15,600 +20,808 @@ from sklearn.metrics import accuracy_score, f1_score, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
+# PyTorch（可选）
 try:
     import torch
     import torch.nn as nn
-    from torch.utils.data import DataLoader, Dataset
-except Exception:
+    from torch.utils.data import DataLoader, TensorDataset
+    HAS_TORCH = True
+except ImportError:
+    HAS_TORCH = False
     torch = None
 
+# tqdm（可选）
 try:
     from tqdm import tqdm
-except Exception:  # pragma: no cover
+except ImportError:
     tqdm = None
 
-import librosa
-
-# ---------------------------------------------------------------------
-# 1) Paths (keep original .npz paths)
-# ---------------------------------------------------------------------
-DEFAULT_TRAIN = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits/train_full.npz")
-DEFAULT_VAL = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results/splits/val.npz")
-DEFAULT_OUT = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/results")
-DEFAULT_MODEL = Path("/Users/panmingh/Code/ML_Coursework/MyCourse/models/final_model.pkl")
-DEFAULT_MODEL_DIR = DEFAULT_MODEL.parent
-DEFAULT_MODEL_PATHS = {
-    "knn": DEFAULT_MODEL_DIR / "knn_model.pkl",
-    "rf": DEFAULT_MODEL_DIR / "rf_model.pkl",
-    "mlp": DEFAULT_MODEL_DIR / "mlp_model.pkl",
-    "cnn": DEFAULT_MODEL_DIR / "cnn_model.pkl",
-    "final": DEFAULT_MODEL,
-}
+warnings.filterwarnings("ignore", category=RuntimeWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 
-# ---------------------------------------------------------------------
-# 2) Config
-# ---------------------------------------------------------------------
+# =====================================================================
+# 配置
+# =====================================================================
 @dataclass
 class TrainConfig:
+    # 数据路径
+    train_path: Path = Path("C:\\Users\\ASUS\\Desktop\\ML_Course\\ML_Coursework\\MyCourse\\results\\splits\\train_selected.npz")
+    val_path: Path = Path("C:\\Users\\ASUS\\Desktop\\ML_Course\\ML_Coursework\\MyCourse\\results\\splits\\val_selected.npz")
+    test_path: Path = Path("C:\\Users\\ASUS\\Desktop\\ML_Course\\ML_Coursework\\MyCourse\\results\\splits\\test_selected.npz")
+    
+    # 输出路径
+    out_dir: Path = Path("C:\\Users\\ASUS\\Desktop\\ML_Course\\ML_Coursework\\MyCourse\\results\\training")
+    model_dir: Path = Path("C:\\Users\\ASUS\\Desktop\\ML_Course\\ML_Coursework\\MyCourse\\models")
+    
+    # 交叉验证
     n_splits: int = 5
     random_seed: int = 42
+    
+    # 是否包含各模型
+    include_knn: bool = True
+    include_rf: bool = True
+    include_mlp: bool = True
+    include_deep: bool = True  # PyTorch DeepMLP
 
 
 @dataclass
-class MLPStableConfig:
-    hidden_layer_sizes: Tuple[int, int] = (128, 64)
-    alpha: float = 1e-3
+class MLPConfig:
+    """sklearn MLP配置"""
+    hidden_layer_sizes: Tuple[int, ...] = (128, 64)
+    alpha: float = 1e-3        # L2正则化
+    lr: float = 1e-3           # 学习率
+    max_iter: int = 300        # 最大迭代次数
+
+
+@dataclass
+class DeepMLPConfig:
+    """PyTorch DeepMLP配置"""
+    hidden_sizes: List[int] = field(default_factory=lambda: [256, 128, 64])
+    dropout: float = 0.3
     lr: float = 1e-3
-    epochs: int = 200
+    weight_decay: float = 1e-4
+    epochs: int = 100
+    batch_size: int = 64
+    patience: int = 15         # 早停patience
 
 
-# ---------------------------------------------------------------------
-# 3) Loading + logging
-# ---------------------------------------------------------------------
-def load_features(path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+# =====================================================================
+# 数据加载与预处理
+# =====================================================================
+
+def load_npz(path: Path) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    """加载npz文件"""
     data = np.load(path, allow_pickle=True)
     X = data["X"].astype(np.float32)
     y = data["labels"].astype(str)
-    paths = data["paths"].astype(str)
-    return X, y, paths
+    names = data["feature_names"].tolist() if "feature_names" in data else []
+    return X, y, names
 
 
-def log_feature_stats(name: str, X: np.ndarray) -> None:
-    finite_mask = np.isfinite(X)
-    finite_ratio = float(np.mean(finite_mask))
-    print(
-        f"[{name}] shape={X.shape} finite={finite_ratio:.3f} "
-        f"min={np.nanmin(X):.4f} max={np.nanmax(X):.4f}"
-    )
+def sanitize_features(X: np.ndarray) -> np.ndarray:
+    """处理NaN和Inf"""
+    return np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
 
-def log_label_stats(name: str, y: np.ndarray) -> None:
-    unique, counts = np.unique(y, return_counts=True)
-    dist = ", ".join([f"{u}:{c}" for u, c in zip(unique, counts)])
-    print(f"[{name}] samples={len(y)} classes={len(unique)} dist={{ {dist} }}")
-
-
-# ---------------------------------------------------------------------
-# 4) Preprocessing helpers
-# ---------------------------------------------------------------------
-def sanitize_features(
-    X_train: np.ndarray, X_val: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0)
-    low = np.percentile(X_train, 1, axis=0)
-    high = np.percentile(X_train, 99, axis=0)
-    X_train = np.clip(X_train, low, high)
-    X_val = np.clip(X_val, low, high)
-    return X_train, X_val
-
-
-def compute_clip_bounds(
-    X: np.ndarray, low_q: float = 1.0, high_q: float = 99.0
-) -> Tuple[np.ndarray, np.ndarray]:
-    low = np.percentile(X, low_q, axis=0)
-    high = np.percentile(X, high_q, axis=0)
-    return low, high
-
-
-def apply_clip(X: np.ndarray, low: np.ndarray, high: np.ndarray) -> np.ndarray:
-    return np.clip(X, low, high)
-
-
-def preprocess_mlp(
-    X_train: np.ndarray, X_val: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, StandardScaler, Tuple[np.ndarray, np.ndarray]]:
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-    X_val = np.nan_to_num(X_val, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float64)
-    low, high = compute_clip_bounds(X_train, low_q=1.0, high_q=99.0)
-    X_train = apply_clip(X_train, low, high)
-    X_val = apply_clip(X_val, low, high)
-
+def preprocess_for_mlp(
+    X_train: np.ndarray, 
+    X_val: np.ndarray,
+    X_test: Optional[np.ndarray] = None
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray], StandardScaler, Tuple]:
+    """MLP预处理：clip + 标准化（修复版）
+    
+    关键修复：先在原始数据上计算clip边界，再应用clip
+    """
+    # Step 1: 处理NaN/Inf
+    X_train = sanitize_features(X_train)
+    X_val = sanitize_features(X_val)
+    if X_test is not None:
+        X_test = sanitize_features(X_test)
+    
+    # Step 2: 基于原始训练集计算clip边界（1-99百分位）
+    clip_low = np.percentile(X_train, 1, axis=0)
+    clip_high = np.percentile(X_train, 99, axis=0)
+    
+    # Step 3: 应用clip
+    X_train = np.clip(X_train, clip_low, clip_high)
+    X_val = np.clip(X_val, clip_low, clip_high)
+    if X_test is not None:
+        X_test = np.clip(X_test, clip_low, clip_high)
+    
+    # Step 4: 标准化
     scaler = StandardScaler()
     X_train = scaler.fit_transform(X_train)
     X_val = scaler.transform(X_val)
-
-    X_train = np.clip(X_train, -3.0, 3.0)
-    X_val = np.clip(X_val, -3.0, 3.0)
-    return X_train, X_val, scaler, (low, high)
-
-
-# ---------------------------------------------------------------------
-# 5) Metrics
-# ---------------------------------------------------------------------
-def macro_auc(y_true: np.ndarray, y_proba: np.ndarray, classes: List[int]) -> float:
-    try:
-        return float(
-            roc_auc_score(
-                y_true,
-                y_proba,
-                multi_class="ovr",
-                average="macro",
-                labels=classes,
-            )
-        )
-    except Exception:
-        return float("nan")
+    if X_test is not None:
+        X_test = scaler.transform(X_test)
+    
+    # Step 5: 标准化后再clip到[-5, 5]防止极端值
+    X_train = np.clip(X_train, -5.0, 5.0)
+    X_val = np.clip(X_val, -5.0, 5.0)
+    if X_test is not None:
+        X_test = np.clip(X_test, -5.0, 5.0)
+    
+    clip_bounds = (clip_low, clip_high)
+    return X_train, X_val, X_test, scaler, clip_bounds
 
 
-def evaluate_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray
-) -> Dict[str, float]:
-    classes = sorted(np.unique(y_true).tolist())
-    return {
-        "macro_auc": macro_auc(y_true, y_proba, classes),
-        "accuracy": float(accuracy_score(y_true, y_pred)),
-        "macro_f1": float(f1_score(y_true, y_pred, average="macro")),
+# =====================================================================
+# 评估指标
+# =====================================================================
+
+def evaluate(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> Dict[str, float]:
+    """计算评估指标"""
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "macro_f1": f1_score(y_true, y_pred, average="macro"),
     }
+    
+    # Macro AUC（OvR）
+    try:
+        if y_proba.shape[1] == 2:
+            metrics["macro_auc"] = roc_auc_score(y_true, y_proba[:, 1])
+        else:
+            metrics["macro_auc"] = roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
+    except ValueError:
+        metrics["macro_auc"] = float("nan")
+    
+    return metrics
 
 
-# ---------------------------------------------------------------------
-# 6) CV search
-# ---------------------------------------------------------------------
-def cv_score(
-    build_model: Any,
-    param_grid: List[Dict[str, Any]],
-    X: np.ndarray,
-    y: np.ndarray,
-    cfg: TrainConfig,
-) -> Tuple[Dict[str, Any], float, int]:
-    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.random_seed)
-    best_params: Dict[str, Any] = {}
-    best_score = -np.inf
-    failed_folds = 0
-    iterator = tqdm(param_grid, desc="CV params", unit="cfg") if tqdm else param_grid
-    for params in iterator:
-        scores = []
-        for train_idx, val_idx in skf.split(X, y):
-            model = build_model(params)
-            try:
-                model.fit(X[train_idx], y[train_idx])
-                y_proba = model.predict_proba(X[val_idx])
-                score = macro_auc(y[val_idx], y_proba, sorted(np.unique(y).tolist()))
-                if not np.isnan(score):
-                    scores.append(score)
-            except ValueError:
-                failed_folds += 1
-                continue
-        mean_score = float(np.mean(scores)) if scores else float("-inf")
-        if mean_score > best_score:
-            best_score = mean_score
-            best_params = params
-    return best_params, best_score, failed_folds
+# =====================================================================
+# 模型构建
+# =====================================================================
+
+def build_knn(params: Dict) -> KNeighborsClassifier:
+    return KNeighborsClassifier(**params)
 
 
-def build_knn(params: Dict[str, Any]) -> Pipeline:
-    return Pipeline(
-        [
-            ("scaler", StandardScaler()),
-            ("clf", KNeighborsClassifier(**params)),
-        ]
-    )
+def build_rf(params: Dict) -> RandomForestClassifier:
+    return RandomForestClassifier(**params, random_state=42, n_jobs=-1)
 
 
-def build_rf(params: Dict[str, Any]) -> RandomForestClassifier:
-    return RandomForestClassifier(random_state=42, **params)
-
-
-def train_mlp_stable(
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    cfg: MLPStableConfig,
-) -> Tuple[MLPClassifier, Dict[str, float]]:
-    model = MLPClassifier(
+def build_mlp(cfg: MLPConfig) -> MLPClassifier:
+    return MLPClassifier(
         hidden_layer_sizes=cfg.hidden_layer_sizes,
         solver="adam",
         activation="relu",
         learning_rate_init=cfg.lr,
         learning_rate="adaptive",
         alpha=cfg.alpha,
-        max_iter=cfg.epochs,
+        max_iter=cfg.max_iter,
         early_stopping=True,
         validation_fraction=0.1,
-        n_iter_no_change=10,
+        n_iter_no_change=15,
         random_state=42,
     )
-    model.fit(X_train, y_train)
-    y_proba = model.predict_proba(X_val)
-    y_pred = np.argmax(y_proba, axis=1)
-    metrics = evaluate_metrics(y_val, y_pred, y_proba)
-    return model, metrics
 
 
-# ---------------------------------------------------------------------
-# 7) CNN utilities (optional)
-# ---------------------------------------------------------------------
-class MFCCDataset(Dataset):
-    def __init__(
-        self,
-        paths: List[str],
-        labels: np.ndarray,
-        label_encoder: LabelEncoder,
-        sr: int,
-        n_mfcc: int,
-    ):
-        self.paths = paths
-        self.labels = label_encoder.transform(labels)
-        self.sr = sr
-        self.n_mfcc = n_mfcc
+# =====================================================================
+# PyTorch DeepMLP
+# =====================================================================
 
-    def __len__(self) -> int:
-        return len(self.paths)
-
-    def __getitem__(self, idx: int) -> Tuple[np.ndarray, int]:
-        path = self.paths[idx]
-        y, _ = librosa.load(path, sr=self.sr, mono=True)
-        mfcc = librosa.feature.mfcc(y=y, sr=self.sr, n_mfcc=self.n_mfcc)
-        return mfcc.astype(np.float32), int(self.labels[idx])
-
-
-class SimpleCNN(nn.Module):
-    def __init__(self, n_mfcc: int, n_classes: int):
+class DeepMLP(nn.Module):
+    """更深的MLP网络，带BatchNorm和Dropout"""
+    
+    def __init__(self, input_dim: int, hidden_sizes: List[int], num_classes: int, dropout: float = 0.3):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv1d(n_mfcc, 32, kernel_size=5, padding=2),
-            nn.BatchNorm1d(32),
-            nn.ReLU(),
-            nn.MaxPool1d(2),
-            nn.Conv1d(32, 64, kernel_size=5, padding=2),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.AdaptiveMaxPool1d(1),
-        )
-        self.fc = nn.Linear(64, n_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.net(x)
-        x = x.squeeze(-1)
-        return self.fc(x)
-
-
-def collate_pad(batch: List[Tuple[np.ndarray, int]]) -> Tuple[torch.Tensor, torch.Tensor]:
-    lengths = [b[0].shape[1] for b in batch]
-    max_len = max(lengths)
-    n_mfcc = batch[0][0].shape[0]
-    padded = np.zeros((len(batch), n_mfcc, max_len), dtype=np.float32)
-    labels = np.zeros(len(batch), dtype=np.int64)
-    for i, (mfcc, label) in enumerate(batch):
-        padded[i, :, : mfcc.shape[1]] = mfcc
-        labels[i] = label
-    return torch.from_numpy(padded), torch.from_numpy(labels)
+        
+        layers = []
+        prev_dim = input_dim
+        
+        for h in hidden_sizes:
+            layers.extend([
+                nn.Linear(prev_dim, h),
+                nn.BatchNorm1d(h),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+            ])
+            prev_dim = h
+        
+        layers.append(nn.Linear(prev_dim, num_classes))
+        self.net = nn.Sequential(*layers)
+    
+    def forward(self, x):
+        return self.net(x)
 
 
-def train_cnn(
-    train_paths: List[str],
-    train_labels: np.ndarray,
-    val_paths: List[str],
-    val_labels: np.ndarray,
-    label_encoder: LabelEncoder,
-    epochs: int = 20,
-    batch_size: int = 16,
-    lr: float = 1e-3,
-    device: str = "cpu",
-) -> Tuple[Dict[str, float], Dict[str, Any]]:
-    if torch is None:
-        raise RuntimeError("PyTorch is required for CNN training.")
-
-    n_mfcc = 13
-    n_classes = len(label_encoder.classes_)
-    train_ds = MFCCDataset(train_paths, train_labels, label_encoder, sr=22050, n_mfcc=n_mfcc)
-    val_ds = MFCCDataset(val_paths, val_labels, label_encoder, sr=22050, n_mfcc=n_mfcc)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_pad)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_pad)
-
-    model = SimpleCNN(n_mfcc=n_mfcc, n_classes=n_classes).to(device)
-    optim = torch.optim.Adam(model.parameters(), lr=lr)
-    criterion = nn.CrossEntropyLoss()
-
-    for epoch in range(1, epochs + 1):
-        model.train()
-        batch_iter = train_loader
-        if tqdm:
-            batch_iter = tqdm(
-                train_loader,
-                desc=f"CNN train {epoch}/{epochs}",
-                unit="batch",
-                leave=False,
-            )
-        for xb, yb in batch_iter:
-            xb = xb.to(device)
-            yb = yb.to(device)
-            optim.zero_grad()
-            logits = model(xb)
-            loss = criterion(logits, yb)
-            loss.backward()
-            optim.step()
-
-    model.eval()
-    all_probs = []
-    all_true = []
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb = xb.to(device)
-            logits = model(xb)
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
-            all_probs.append(probs)
-            all_true.append(yb.numpy())
-
-    y_true = np.concatenate(all_true)
-    y_proba = np.vstack(all_probs)
-    y_pred = np.argmax(y_proba, axis=1)
-    metrics = evaluate_metrics(y_true, y_pred, y_proba)
-    return metrics, {"model": model, "label_encoder": label_encoder}
-
-
-def filter_existing_audio(paths: np.ndarray, labels: np.ndarray) -> Tuple[List[str], np.ndarray]:
-    out_paths: List[str] = []
-    out_labels: List[str] = []
-    for p, y in zip(paths, labels):
-        if "::" in p:
-            continue
-        if Path(p).is_file():
-            out_paths.append(p)
-            out_labels.append(y)
-    return out_paths, np.asarray(out_labels)
-
-
-def save_payload(payload: Dict[str, Any], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    dump(payload, path)
-
-
-def retrain_and_save_sklearn_models(
-    results: Dict[str, Any],
+def train_deep_mlp(
     X_train: np.ndarray,
+    y_train: np.ndarray,
     X_val: np.ndarray,
-    y_train_enc: np.ndarray,
-    y_val_enc: np.ndarray,
-    label_encoder: LabelEncoder,
-    mlp_cfg: MLPStableConfig,
-    model_paths: Dict[str, Path] | None = None,
-) -> Dict[str, Path]:
-    paths = model_paths or DEFAULT_MODEL_PATHS
-    saved: Dict[str, Path] = {}
-    X_full = np.vstack([X_train, X_val])
-    y_full = np.concatenate([y_train_enc, y_val_enc])
+    y_val: np.ndarray,
+    cfg: DeepMLPConfig,
+) -> Tuple[nn.Module, Dict[str, Any]]:
+    """训练PyTorch DeepMLP"""
+    
+    if not HAS_TORCH:
+        raise RuntimeError("PyTorch未安装")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 数据转换
+    X_train_t = torch.FloatTensor(X_train)
+    y_train_t = torch.LongTensor(y_train)
+    X_val_t = torch.FloatTensor(X_val)
+    y_val_t = torch.LongTensor(y_val)
+    
+    train_ds = TensorDataset(X_train_t, y_train_t)
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    
+    # 模型
+    input_dim = X_train.shape[1]
+    num_classes = len(np.unique(y_train))
+    model = DeepMLP(input_dim, cfg.hidden_sizes, num_classes, cfg.dropout).to(device)
+    
+    # 优化器和损失
+    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', patience=5, factor=0.5)
+    criterion = nn.CrossEntropyLoss()
+    
+    # 训练循环
+    best_auc = 0.0
+    best_state = None
+    patience_counter = 0
+    history = {"train_loss": [], "val_auc": [], "val_acc": []}
+    
+    iterator = range(cfg.epochs)
+    if tqdm is not None:
+        iterator = tqdm(iterator, desc="DeepMLP", unit="ep")
+    
+    for epoch in iterator:
+        # 训练
+        model.train()
+        total_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            optimizer.zero_grad()
+            out = model(xb)
+            loss = criterion(out, yb)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 梯度裁剪
+            optimizer.step()
+            total_loss += loss.item()
+        
+        avg_loss = total_loss / len(train_loader)
+        history["train_loss"].append(avg_loss)
+        
+        # 验证
+        model.eval()
+        with torch.no_grad():
+            logits = model(X_val_t.to(device))
+            proba = torch.softmax(logits, dim=1).cpu().numpy()
+            pred = np.argmax(proba, axis=1)
+        
+        metrics = evaluate(y_val, pred, proba)
+        history["val_auc"].append(metrics["macro_auc"])
+        history["val_acc"].append(metrics["accuracy"])
+        
+        scheduler.step(metrics["macro_auc"])
+        
+        # 早停
+        if metrics["macro_auc"] > best_auc:
+            best_auc = metrics["macro_auc"]
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            patience_counter = 0
+        else:
+            patience_counter += 1
+        
+        if patience_counter >= cfg.patience:
+            if tqdm is not None:
+                iterator.set_postfix({"early_stop": epoch})
+            break
+        
+        if tqdm is not None:
+            iterator.set_postfix({"loss": f"{avg_loss:.4f}", "auc": f"{metrics['macro_auc']:.4f}"})
+    
+    # 加载最佳模型
+    if best_state is not None:
+        model.load_state_dict(best_state)
+    
+    return model, {"history": history, "best_auc": best_auc}
 
-    if "knn" in results and "best_params" in results["knn"]:
-        model = build_knn(results["knn"]["best_params"])
-        model.fit(X_full, y_full)
-        save_payload({"model": model, "label_encoder": label_encoder}, paths["knn"])
-        saved["knn"] = paths["knn"]
 
-    if "rf" in results and "best_params" in results["rf"]:
-        model = build_rf(results["rf"]["best_params"])
-        model.fit(X_full, y_full)
-        save_payload({"model": model, "label_encoder": label_encoder}, paths["rf"])
-        saved["rf"] = paths["rf"]
+# =====================================================================
+# 交叉验证
+# =====================================================================
 
-    if "mlp" in results and "config" in results["mlp"]:
-        X_full_mlp, _, mlp_scaler, clip_bounds = preprocess_mlp(X_full, X_full)
-        model = MLPClassifier(
-            hidden_layer_sizes=mlp_cfg.hidden_layer_sizes,
-            solver="adam",
-            activation="relu",
-            learning_rate_init=mlp_cfg.lr,
-            learning_rate="adaptive",
-            alpha=mlp_cfg.alpha,
-            max_iter=mlp_cfg.epochs,
-            early_stopping=True,
-            validation_fraction=0.1,
-            n_iter_no_change=10,
-            random_state=42,
+def cv_search(
+    builder_fn,
+    param_grid: List[Dict],
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: TrainConfig,
+) -> Tuple[Dict, float]:
+    """网格搜索 + 交叉验证（用于原始特征模型：KNN/RF）"""
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.random_seed)
+
+    best_params = None
+    best_score = -1.0
+
+    for params in param_grid:
+        scores = []
+        for train_idx, val_idx in skf.split(X, y):
+            X_tr, X_vl = X[train_idx], X[val_idx]
+            y_tr, y_vl = y[train_idx], y[val_idx]
+
+            try:
+                model = builder_fn(params)
+                model.fit(X_tr, y_tr)
+                y_proba = model.predict_proba(X_vl)
+                y_pred = np.argmax(y_proba, axis=1)
+                m = evaluate(y_vl, y_pred, y_proba)
+                scores.append(m["macro_auc"])
+            except Exception:
+                scores.append(0.0)
+
+        mean_score = np.nanmean(scores)
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = params
+
+    return best_params, best_score
+
+
+def cv_search_mlp(
+    param_grid: List[Dict],
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: TrainConfig,
+) -> Tuple[Dict, float]:
+    """sklearn MLP的5折CV，按折进行独立预处理以避免泄漏"""
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.random_seed)
+
+    best_params = None
+    best_score = -1.0
+
+    for params in param_grid:
+        # 将参数映射到MLPConfig（未给出则使用默认）
+        mlp_cfg = MLPConfig(
+            hidden_layer_sizes=params.get("hidden_layer_sizes", (128, 64)),
+            alpha=params.get("alpha", 1e-3),
+            lr=params.get("lr", 1e-3),
+            max_iter=params.get("max_iter", 300),
         )
-        model.fit(X_full_mlp, y_full)
-        payload = {
-            "model": model,
-            "label_encoder": label_encoder,
-            "scaler": mlp_scaler,
-            "clip_bounds": clip_bounds,
+
+        scores = []
+        for train_idx, val_idx in skf.split(X, y):
+            X_tr, X_vl = X[train_idx], X[val_idx]
+            y_tr, y_vl = y[train_idx], y[val_idx]
+
+            # 每折独立预处理
+            X_tr_nn, X_vl_nn, _, _, _ = preprocess_for_mlp(X_tr, X_vl)
+
+            try:
+                model = build_mlp(mlp_cfg)
+                model.fit(X_tr_nn, y_tr)
+                y_proba = model.predict_proba(X_vl_nn)
+                y_pred = np.argmax(y_proba, axis=1)
+                m = evaluate(y_vl, y_pred, y_proba)
+                scores.append(m.get("macro_auc", 0.0))
+            except Exception:
+                scores.append(0.0)
+
+        mean_score = np.nanmean(scores)
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = {
+                "hidden_layer_sizes": mlp_cfg.hidden_layer_sizes,
+                "alpha": mlp_cfg.alpha,
+                "lr": mlp_cfg.lr,
+                "max_iter": mlp_cfg.max_iter,
+            }
+
+    return best_params, best_score
+
+
+def cv_search_deep(
+    param_grid: List[Dict],
+    X: np.ndarray,
+    y: np.ndarray,
+    cfg: TrainConfig,
+) -> Tuple[Dict, float]:
+    """PyTorch DeepMLP的5折CV，按折进行独立预处理以避免泄漏"""
+    if not HAS_TORCH:
+        raise RuntimeError("PyTorch未安装，无法进行DeepMLP CV")
+
+    skf = StratifiedKFold(n_splits=cfg.n_splits, shuffle=True, random_state=cfg.random_seed)
+
+    best_params = None
+    best_score = -1.0
+
+    for params in param_grid:
+        # 将参数映射到DeepMLPConfig
+        deep_cfg = DeepMLPConfig(
+            hidden_sizes=params.get("hidden_sizes", [256, 128, 64]),
+            dropout=params.get("dropout", 0.3),
+            lr=params.get("lr", 1e-3),
+            weight_decay=params.get("weight_decay", 1e-4),
+            epochs=params.get("epochs", 60),
+            batch_size=params.get("batch_size", 64),
+            patience=params.get("patience", 10),
+        )
+
+        scores = []
+        for train_idx, val_idx in skf.split(X, y):
+            X_tr, X_vl = X[train_idx], X[val_idx]
+            y_tr, y_vl = y[train_idx], y[val_idx]
+
+            # 每折独立预处理
+            X_tr_nn, X_vl_nn, _, _, _ = preprocess_for_mlp(X_tr, X_vl)
+
+            try:
+                model, _ = train_deep_mlp(X_tr_nn, y_tr, X_vl_nn, y_vl, deep_cfg)
+                model.eval()
+                device = next(model.parameters()).device
+                with torch.no_grad():
+                    X_vl_t = torch.FloatTensor(X_vl_nn).to(device)
+                    logits = model(X_vl_t)
+                    y_proba = torch.softmax(logits, dim=1).cpu().numpy()
+                    y_pred = np.argmax(y_proba, axis=1)
+                m = evaluate(y_vl, y_pred, y_proba)
+                scores.append(m.get("macro_auc", 0.0))
+            except Exception:
+                scores.append(0.0)
+
+        mean_score = np.nanmean(scores)
+        if mean_score > best_score:
+            best_score = mean_score
+            best_params = {
+                "hidden_sizes": deep_cfg.hidden_sizes,
+                "dropout": deep_cfg.dropout,
+                "lr": deep_cfg.lr,
+                "weight_decay": deep_cfg.weight_decay,
+                "epochs": deep_cfg.epochs,
+                "batch_size": deep_cfg.batch_size,
+                "patience": deep_cfg.patience,
+            }
+
+    return best_params, best_score
+
+
+# =====================================================================
+# 主训练流程
+# =====================================================================
+
+def train_all(cfg: TrainConfig) -> Dict[str, Any]:
+    """训练所有模型"""
+    
+    results = {}
+    
+    # ========== 加载数据 ==========
+    print("=" * 60)
+    print("  LOADING DATA (train + val for CV)")
+    print("=" * 60)
+    
+    X_train, y_train, feat_names = load_npz(cfg.train_path)
+    X_val, y_val, _ = load_npz(cfg.val_path)
+    
+    print(f"[Train] {X_train.shape[0]} samples, {X_train.shape[1]} features")
+    print(f"[Val]   {X_val.shape[0]} samples")
+
+    # 合并训练与验证用于CV
+    X_full = np.concatenate([X_train, X_val], axis=0)
+    y_full = np.concatenate([y_train, y_val], axis=0)
+    
+    # 标签编码
+    le = LabelEncoder()
+    le.fit(y_full)
+    y_train_enc = le.transform(y_train)
+    y_val_enc = le.transform(y_val)
+    y_full_enc = le.transform(y_full)
+    
+    print(f"[Classes] {le.classes_.tolist()}")
+    
+    # 预处理（用于最终训练 MLP 和 DeepMLP）将在选参后对全量数据进行
+    
+    # 确保模型保存目录存在
+    cfg.model_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 超参网格
+    knn_grid = [{"n_neighbors": k, "weights": w} for k in [3, 5, 7, 9] for w in ["uniform", "distance"]]
+    rf_grid = [{"n_estimators": n, "max_depth": d} for n in [100, 200] for d in [5, 10, None]]
+    mlp_grid = [
+        {"hidden_layer_sizes": (128, 64), "alpha": 1e-3, "lr": 1e-3},
+        {"hidden_layer_sizes": (256, 128), "alpha": 1e-4, "lr": 1e-3},
+        {"hidden_layer_sizes": (128, 64, 32), "alpha": 1e-3, "lr": 1e-3},
+    ]
+    deep_grid = [
+        {"hidden_sizes": [256, 128, 64], "dropout": 0.3, "lr": 1e-3, "weight_decay": 1e-4, "epochs": 60, "batch_size": 64, "patience": 10},
+        {"hidden_sizes": [128, 64], "dropout": 0.3, "lr": 5e-4, "weight_decay": 5e-5, "epochs": 80, "batch_size": 64, "patience": 10},
+    ]
+    
+    # ========== KNN ==========
+    if cfg.include_knn:
+        print("\n" + "-" * 60)
+        print("  CV Selecting KNN params (5-fold)")
+        print("-" * 60)
+        
+        best_params, cv_auc = cv_search(build_knn, knn_grid, X_full, y_full_enc, cfg)
+        
+        # 用全部数据训练最终模型
+        model = build_knn(best_params)
+        model.fit(X_full, y_full_enc)
+        
+        results["knn"] = {
+            "best_params": best_params,
+            "cv_auc": cv_auc,
+            "final_model_trained": True,
         }
-        save_payload(payload, paths["mlp"])
-        saved["mlp"] = paths["mlp"]
+        print(f"  params: {best_params}")
+        print(f"  cv_auc={cv_auc:.4f}")
+        # 保存模型（含标签编码器）
+        try:
+            knn_path = cfg.model_dir / "knn_model.pkl"
+            dump({"model": model, "label_encoder": le}, knn_path)
+            print(f"  [保存模型] {knn_path}")
+        except Exception as e:
+            print(f"  [保存失败] KNN: {e}")
+    
+    # ========== Random Forest ==========
+    if cfg.include_rf:
+        print("\n" + "-" * 60)
+        print("  CV Selecting Random Forest params (5-fold)")
+        print("-" * 60)
+        
+        best_params, cv_auc = cv_search(build_rf, rf_grid, X_full, y_full_enc, cfg)
+        
+        # 用全部数据训练最终模型
+        model = build_rf(best_params)
+        model.fit(X_full, y_full_enc)
+        
+        results["rf"] = {
+            "best_params": best_params,
+            "cv_auc": cv_auc,
+            "final_model_trained": True,
+        }
+        print(f"  params: {best_params}")
+        print(f"  cv_auc={cv_auc:.4f}")
+        # 保存模型（含标签编码器）
+        try:
+            rf_path = cfg.model_dir / "rf_model.pkl"
+            dump({"model": model, "label_encoder": le}, rf_path)
+            print(f"  [保存模型] {rf_path}")
+        except Exception as e:
+            print(f"  [保存失败] RF: {e}")
+    
+    # ========== sklearn MLP ==========
+    if cfg.include_mlp:
+        print("\n" + "-" * 60)
+        print("  CV Selecting MLP (sklearn) params (5-fold)")
+        print("-" * 60)
+        
+        try:
+            best_params, cv_auc = cv_search_mlp(mlp_grid, X_full, y_full_enc, cfg)
+            # 用全部数据进行最终预处理并训练
+            X_full_nn, _, _, scaler, clip_bounds = preprocess_for_mlp(X_full, X_full)
+            mlp_cfg = MLPConfig(
+                hidden_layer_sizes=best_params.get("hidden_layer_sizes", (128, 64)),
+                alpha=best_params.get("alpha", 1e-3),
+                lr=best_params.get("lr", 1e-3),
+                max_iter=best_params.get("max_iter", 300),
+            )
+            model = build_mlp(mlp_cfg)
+            model.fit(X_full_nn, y_full_enc)
+            
+            results["mlp"] = {
+                "best_params": best_params,
+                "cv_auc": cv_auc,
+                "final_model_trained": True,
+                "scaler": {
+                    "mean_": scaler.mean_.tolist(),
+                    "scale_": scaler.scale_.tolist(),
+                },
+                "clip_bounds": {
+                    "low": clip_bounds[0].tolist(),
+                    "high": clip_bounds[1].tolist(),
+                },
+            }
+            print(f"  params: {best_params}  cv_auc={cv_auc:.4f}")
+            # 保存模型（连同预处理参数）
+            try:
+                mlp_path = cfg.model_dir / "mlp.pkl"
+                artifact = {
+                    "model": model,
+                    "config": mlp_cfg.__dict__,
+                    "scaler_mean": scaler.mean_.tolist(),
+                    "scaler_scale": scaler.scale_.tolist(),
+                    "clip_low": clip_bounds[0].tolist(),
+                    "clip_high": clip_bounds[1].tolist(),
+                    "classes": le.classes_.tolist(),
+                }
+                dump(artifact, mlp_path)
+                print(f"  [保存模型] {mlp_path}")
+            except Exception as e:
+                print(f"  [保存失败] MLP: {e}")
+        except Exception as e:
+            results["mlp"] = {"error": str(e)}
+            print(f"  [ERROR] {e}")
+    
+    # ========== PyTorch DeepMLP ==========
+    if cfg.include_deep and HAS_TORCH:
+        print("\n" + "-" * 60)
+        print("  CV Selecting DeepMLP (PyTorch) params (5-fold)")
+        print("-" * 60)
+        
+        try:
+            best_params, cv_auc = cv_search_deep(deep_grid, X_full, y_full_enc, cfg)
+            # 用全部数据进行最终预处理并训练（采用全部数据，val用于训练过程记录，不用于评估）
+            X_full_nn, _, _, _, _ = preprocess_for_mlp(X_full, X_full)
+            deep_cfg = DeepMLPConfig(
+                hidden_sizes=best_params.get("hidden_sizes", [256, 128, 64]),
+                dropout=best_params.get("dropout", 0.3),
+                lr=best_params.get("lr", 1e-3),
+                weight_decay=best_params.get("weight_decay", 1e-4),
+                epochs=best_params.get("epochs", 60),
+                batch_size=best_params.get("batch_size", 64),
+                patience=best_params.get("patience", 10),
+            )
+            model, info = train_deep_mlp(X_full_nn, y_full_enc, X_full_nn, y_full_enc, deep_cfg)
+            
+            results["deep_mlp"] = {
+                "best_params": best_params,
+                "cv_auc": cv_auc,
+                "final_model_trained": True,
+                "best_train_auc": info.get("best_auc", None),
+            }
+            print(f"  params: {best_params}  cv_auc={cv_auc:.4f}")
+            # 保存模型（.pt，包含必要的恢复信息）
+            try:
+                deep_path = cfg.model_dir / "mlp_model.pt"
+                # 训练所用的预处理（用于恢复）
+                X_full_nn, _, _, scaler_save, clip_bounds_save = preprocess_for_mlp(X_full, X_full)
+                torch.save({
+                    "model_state": {k: v.cpu() for k, v in model.state_dict().items()},
+                    "config": deep_cfg.__dict__,
+                    "input_dim": int(X_full_nn.shape[1]),
+                    "num_classes": int(len(le.classes_)),
+                    "label_encoder": le,
+                    "scaler": scaler_save,
+                    "clip_bounds": (clip_bounds_save[0], clip_bounds_save[1]),
+                }, deep_path)
+                print(f"  [保存模型] {deep_path}")
+            except Exception as e:
+                print(f"  [保存失败] DeepMLP: {e}")
+        except Exception as e:
+            results["deep_mlp"] = {"error": str(e)}
+            print(f"  [ERROR] {e}")
+    elif cfg.include_deep and not HAS_TORCH:
+        print("\n[SKIP] DeepMLP: PyTorch未安装")
+        results["deep_mlp"] = {"error": "PyTorch not installed"}
+    
+    # ========== 可选：在测试集上评估（如果存在） ==========
+    try:
+        X_test, y_test, _ = load_npz(cfg.test_path)
+        y_test_enc = le.transform(y_test)
+        print("\n" + "-" * 60)
+        print("  Evaluating on TEST set (optional)")
+        print("-" * 60)
+        
+        # KNN
+        if "knn" in results and "error" not in results["knn"]:
+            model = build_knn(results["knn"]["best_params"]) if results["knn"].get("best_params") else build_knn({})
+            model.fit(X_full, y_full_enc)
+            y_proba = model.predict_proba(X_test)
+            y_pred = np.argmax(y_proba, axis=1)
+            results["knn"]["test"] = evaluate(y_test_enc, y_pred, y_proba)
+        
+        # RF
+        if "rf" in results and "error" not in results["rf"]:
+            model = build_rf(results["rf"]["best_params"]) if results["rf"].get("best_params") else build_rf({})
+            model.fit(X_full, y_full_enc)
+            y_proba = model.predict_proba(X_test)
+            y_pred = np.argmax(y_proba, axis=1)
+            results["rf"]["test"] = evaluate(y_test_enc, y_pred, y_proba)
+        
+        # MLP（使用全量训练得到的scaler/clip）
+        if "mlp" in results and "error" not in results["mlp"] and results["mlp"].get("scaler"):
+            # 复用已保存的clip和标准化参数
+            clip_low = np.array(results["mlp"]["clip_bounds"]["low"], dtype=np.float64)
+            clip_high = np.array(results["mlp"]["clip_bounds"]["high"], dtype=np.float64)
+            X_test_proc = np.clip(sanitize_features(X_test), clip_low, clip_high)
+            # 使用保存的scaler参数构建scaler
+            scaler = StandardScaler()
+            scaler.mean_ = np.array(results["mlp"]["scaler"]["mean_"], dtype=np.float64)
+            scaler.scale_ = np.array(results["mlp"]["scaler"]["scale_"], dtype=np.float64)
+            X_full_nn, _, _, _, _ = preprocess_for_mlp(X_full, X_full)  # 重新获得训练用特征
+            X_test_proc = scaler.transform(X_test_proc)
+            X_test_proc = np.clip(X_test_proc, -5.0, 5.0)
+            # 训练并评估
+            mlp_cfg = MLPConfig(
+                hidden_layer_sizes=tuple(results["mlp"]["best_params"]["hidden_layer_sizes"]),
+                alpha=float(results["mlp"]["best_params"]["alpha"]),
+                lr=float(results["mlp"]["best_params"]["lr"]),
+                max_iter=int(results["mlp"]["best_params"].get("max_iter", 300)),
+            )
+            model = build_mlp(mlp_cfg)
+            model.fit(X_full_nn, y_full_enc)
+            y_proba = model.predict_proba(X_test_proc)
+            y_pred = np.argmax(y_proba, axis=1)
+            results["mlp"]["test"] = evaluate(y_test_enc, y_pred, y_proba)
+        
+        # DeepMLP（使用全量训练得到的模型直接评估）
+        if HAS_TORCH and "deep_mlp" in results and "error" not in results["deep_mlp"]:
+            # 预处理与训练同分布
+            X_full_nn, _, _, _, _ = preprocess_for_mlp(X_full, X_full)
+            X_test_nn, _, _, _, _ = preprocess_for_mlp(X_full, X_test)
+            deep_cfg = DeepMLPConfig(**results["deep_mlp"]["best_params"]) if results["deep_mlp"].get("best_params") else DeepMLPConfig()
+            model, _ = train_deep_mlp(X_full_nn, y_full_enc, X_full_nn, y_full_enc, deep_cfg)
+            model.eval()
+            device = next(model.parameters()).device
+            with torch.no_grad():
+                X_t = torch.FloatTensor(X_test_nn).to(device)
+                logits = model(X_t)
+                y_proba = torch.softmax(logits, dim=1).cpu().numpy()
+                y_pred = np.argmax(y_proba, axis=1)
+            results["deep_mlp"]["test"] = evaluate(y_test_enc, y_pred, y_proba)
+    except Exception:
+        print("[INFO] 测试集评估跳过（未找到或标签不匹配）")
 
-    return saved
+    # ========== 选择最佳模型 ==========
+    print("\n" + "=" * 60)
+    print("  SUMMARY")
+    print("=" * 60)
+    
+    def get_cv_auc(name: str) -> float:
+        return results.get(name, {}).get("cv_auc", -1.0)
+    
+    model_names = [k for k in results.keys() if "cv_auc" in results.get(k, {})]
+    if model_names:
+        best_name = max(model_names, key=get_cv_auc)
+        best_auc = get_cv_auc(best_name)
+        results["best_model"] = best_name
+        
+        print(f"\n  Model Performance (CV AUC, 5-fold):")
+        for name in model_names:
+            auc = get_cv_auc(name)
+            marker = " <-- BEST" if name == best_name else ""
+            print(f"    {name:12s}: {auc:.4f}{marker}")
+        
+        print(f"\n  Best Model: {best_name} (AUC={best_auc:.4f})")
+    
+    # ========== 保存结果 ==========
+    cfg.out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # 保存metrics
+    metrics_path = cfg.out_dir / "train_metrics.json"
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        # 转换numpy类型
+        def convert(obj):
+            if isinstance(obj, np.floating):
+                return float(obj)
+            if isinstance(obj, np.integer):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return obj.tolist()
+            return obj
+        
+        json.dump(results, f, default=convert, ensure_ascii=False, indent=2)
+    
+    print(f"\n[保存] {metrics_path}")
+    
+    return results
 
 
-def save_cnn_artifacts(
-    cnn_artifacts: Dict[str, Any] | None, model_paths: Dict[str, Path] | None = None
-) -> Path | None:
-    if cnn_artifacts is None:
-        return None
-    paths = model_paths or DEFAULT_MODEL_PATHS
-    save_payload(cnn_artifacts, paths["cnn"])
-    return paths["cnn"]
+# =====================================================================
+# 主函数
+# =====================================================================
+
+def main():
+    cfg = TrainConfig()
+    
+    # 可以在这里修改配置
+    # cfg.train_path = Path("your/path/train.npz")
+    # cfg.include_deep = False  # 不训练PyTorch模型
+    
+    results = train_all(cfg)
+    
+    print("\n" + "=" * 60)
+    print("  DONE")
+    print("=" * 60)
 
 
-# ---------------------------------------------------------------------
-# 8) Example "notebook flow" (copy into cells if desired)
-# ---------------------------------------------------------------------
-# X_train, y_train, train_paths = load_features(DEFAULT_TRAIN)
-# X_val, y_val, val_paths = load_features(DEFAULT_VAL)
-# X_train, X_val = sanitize_features(X_train, X_val)
-# log_feature_stats("train", X_train)
-# log_feature_stats("val", X_val)
-# log_label_stats("train", y_train)
-# log_label_stats("val", y_val)
-# print(f"[paths] train_paths={len(train_paths)} val_paths={len(val_paths)}")
-#
-# le = LabelEncoder()
-# le.fit(np.concatenate([y_train, y_val]))
-# y_train_enc = le.transform(y_train)
-# y_val_enc = le.transform(y_val)
-#
-# cfg = TrainConfig()
-# results: Dict[str, Any] = {}
-#
-# knn_grid = [
-#     {"n_neighbors": k, "weights": w}
-#     for k in [3, 5, 7, 9]
-#     for w in ["uniform", "distance"]
-# ]
-# rf_grid = [
-#     {"n_estimators": n, "max_depth": d}
-#     for n in [100, 200]
-#     for d in [5, 10, None]
-# ]
-# warnings.filterwarnings("ignore", category=RuntimeWarning)
-# warnings.filterwarnings("ignore", category=UserWarning)
-#
-# for name, builder, grid in [
-#     ("knn", build_knn, knn_grid),
-#     ("rf", build_rf, rf_grid),
-# ]:
-#     if tqdm is None:
-#         print(f"Training {name}...")
-#     print(f"[{name}] cv_folds={cfg.n_splits} grid_size={len(grid)}")
-#     best_params, cv_auc, failed_folds = cv_score(builder, grid, X_train, y_train_enc, cfg)
-#     try:
-#         model = builder(best_params)
-#         model.fit(X_train, y_train_enc)
-#         y_proba = model.predict_proba(X_val)
-#         y_pred = np.argmax(y_proba, axis=1)
-#         metrics = evaluate_metrics(y_val_enc, y_pred, y_proba)
-#         results[name] = {"best_params": best_params, "cv_macro_auc": cv_auc, "val": metrics}
-#         print(
-#             f"[{name}] cv_macro_auc={cv_auc:.4f} "
-#             f"val_auc={metrics['macro_auc']:.4f} "
-#             f"val_acc={metrics['accuracy']:.4f} "
-#             f"val_f1={metrics['macro_f1']:.4f} "
-#             f"failed_folds={failed_folds}"
-#         )
-#     except ValueError as exc:
-#         results[name] = {
-#             "best_params": best_params,
-#             "cv_macro_auc": cv_auc,
-#             "error": str(exc),
-#         }
-#         print(f"[{name}] failed after CV: {exc} failed_folds={failed_folds}")
-#
-# mlp_cfg = MLPStableConfig()
-# X_train_mlp, X_val_mlp, mlp_scaler, clip_bounds = preprocess_mlp(X_train, X_val)
-# try:
-#     mlp_model, mlp_metrics = train_mlp_stable(
-#         X_train_mlp, y_train_enc, X_val_mlp, y_val_enc, mlp_cfg
-#     )
-#     results["mlp"] = {
-#         "config": mlp_cfg.__dict__,
-#         "val": mlp_metrics,
-#     }
-#     print(
-#         f"[mlp] val_auc={mlp_metrics['macro_auc']:.4f} "
-#         f"val_acc={mlp_metrics['accuracy']:.4f} "
-#         f"val_f1={mlp_metrics['macro_f1']:.4f}"
-#     )
-# except ValueError as exc:
-#     results["mlp"] = {"config": mlp_cfg.__dict__, "error": str(exc)}
-#     print(f"[mlp] failed: {exc}")
-#
-# # Optional CNN (requires torch)
-# include_cnn = False
-# if include_cnn and torch is not None:
-#     train_audio, y_train_audio = filter_existing_audio(train_paths, y_train)
-#     val_audio, y_val_audio = filter_existing_audio(val_paths, y_val)
-#     if train_audio and val_audio:
-#         cnn_metrics, cnn_artifacts = train_cnn(
-#             train_audio,
-#             y_train_audio,
-#             val_audio,
-#             y_val_audio,
-#             le,
-#             epochs=20,
-#         )
-#         results["cnn"] = {"val": cnn_metrics}
-#     else:
-#         results["cnn"] = {"error": "No valid audio paths for CNN."}
-#
-# def _score(name: str) -> float:
-#     val_score = results.get(name, {}).get("val", {}).get("macro_auc", float("-inf"))
-#     return val_score if not np.isnan(val_score) else float("-inf")
-#
-# best_name = max(results.keys(), key=_score)
-# results["best_model"] = best_name
-#
-# DEFAULT_OUT.mkdir(parents=True, exist_ok=True)
-# with (DEFAULT_OUT / "train_metrics.json").open("w", encoding="utf-8") as f:
-#     json.dump(results, f, ensure_ascii=False, indent=2)
-#
-# if best_name == "cnn":
-#     payload = cnn_artifacts
-# else:
-#     # Retrain best sklearn model on Train+Val
-#     X_full = np.vstack([X_train, X_val])
-#     y_full = np.concatenate([y_train_enc, y_val_enc])
-#     if best_name == "knn":
-#         final_model = build_knn(results["knn"]["best_params"])
-#         final_model.fit(X_full, y_full)
-#         payload = {"model": final_model, "label_encoder": le}
-#     elif best_name == "rf":
-#         final_model = build_rf(results["rf"]["best_params"])
-#         final_model.fit(X_full, y_full)
-#         payload = {"model": final_model, "label_encoder": le}
-#     else:
-#         X_full_mlp, _, mlp_scaler, clip_bounds = preprocess_mlp(X_full, X_full)
-#         final_model = MLPClassifier(
-#             hidden_layer_sizes=mlp_cfg.hidden_layer_sizes,
-#             solver="adam",
-#             activation="relu",
-#             learning_rate_init=mlp_cfg.lr,
-#             learning_rate="adaptive",
-#             alpha=mlp_cfg.alpha,
-#             max_iter=mlp_cfg.epochs,
-#             early_stopping=True,
-#             validation_fraction=0.1,
-#             n_iter_no_change=10,
-#             random_state=42,
-#         )
-#         final_model.fit(X_full_mlp, y_full)
-#         payload = {
-#             "model": final_model,
-#             "label_encoder": le,
-#             "scaler": mlp_scaler,
-#             "clip_bounds": clip_bounds,
-#         }
-#     DEFAULT_MODEL.parent.mkdir(parents=True, exist_ok=True)
-#     dump(payload, DEFAULT_MODEL)
-#
-# # Save all sklearn models (KNN/RF/MLP) for multi-model evaluation
-# saved_paths = retrain_and_save_sklearn_models(
-#     results,
-#     X_train,
-#     X_val,
-#     y_train_enc,
-#     y_val_enc,
-#     le,
-#     mlp_cfg,
-#     model_paths=DEFAULT_MODEL_PATHS,
-# )
-# print(f"saved sklearn models: {saved_paths}")
-#
-# # Save CNN if trained
-# if "cnn" in results and "val" in results["cnn"]:
-#     cnn_path = save_cnn_artifacts(cnn_artifacts, model_paths=DEFAULT_MODEL_PATHS)
-#     print(f"saved cnn model: {cnn_path}")
+if __name__ == "__main__":
+    main()
